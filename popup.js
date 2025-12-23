@@ -13,6 +13,12 @@ function extractRootDomain(url) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  // 1. Focus the slider immediately for keyboard control
+  const slider = document.getElementById('volume-slider');
+  if (slider) {
+      slider.focus();
+  }
+
   // Settings Button
   const settingsBtn = document.getElementById('settings');
   if (settingsBtn) {
