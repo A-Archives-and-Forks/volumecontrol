@@ -98,7 +98,27 @@ function handleTabs(tabs) {
 
     browserApi.tabs.sendMessage(currentTab.id, { command: "checkExclusion" }, (response) => {
         if (browserApi.runtime.lastError) {
-            showError({ type: "exclusion" });
+            // Content script didn't respond — fall back to storage check to decide whether the page is truly excluded.
+            (async () => {
+                try {
+                    const domain = extractRootDomain(currentTab.url);
+                    if (!domain) {
+                        showError({ type: "exclusion" });
+                        return;
+                    }
+                    const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
+                    let isExcluded = false;
+                    if (data.whitelistMode) {
+                        const remembered = Object.keys(data.siteSettings || {});
+                        isExcluded = !remembered.includes(domain);
+                    } else {
+                        isExcluded = data.fqdns.includes(domain);
+                    }
+                    if (isExcluded) showError({ type: "exclusion" });
+                } catch (e) {
+                    showError({ type: "exclusion" });
+                }
+            })();
         }
     });
     
@@ -118,14 +138,16 @@ async function updateEnableSwitch(tab) {
     }
 
     try {
-        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
-        let isExcluded = false;
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {} });
 
+        // When whitelist mode is active, remembered sites determine which pages are allowed.
+        // Hide the enable/active switch to avoid duplicate controls and potential user confusion.
         if (data.whitelistMode) {
-            isExcluded = !data.whitelist.includes(domain);
-        } else {
-            isExcluded = data.fqdns.includes(domain);
+            if (switchLabel) switchLabel.style.display = 'none';
+            return;
         }
+
+        let isExcluded = data.fqdns.includes(domain);
 
         if (checkbox) checkbox.checked = !isExcluded;
 
@@ -144,14 +166,27 @@ async function toggleSitePermission(domain, shouldExclude, tabId) {
         const newData = {};
 
         if (data.whitelistMode) {
-            newData.whitelist = data.whitelist || [];
+            // Edit remembered sites instead of an arbitrary whitelist
+            const sd = await storageGet({ siteSettings: {} });
+            const settings = sd.siteSettings || {};
             if (shouldExclude) {
-                const idx = newData.whitelist.indexOf(domain);
-                if (idx > -1) newData.whitelist.splice(idx, 1);
+                if (settings[domain]) {
+                    delete settings[domain];
+                    await storageSet({ siteSettings: settings });
+                }
             } else {
-                if (!newData.whitelist.includes(domain)) newData.whitelist.push(domain);
+                if (!settings[domain]) {
+                    settings[domain] = { volume: 0, mono: false };
+                    await storageSet({ siteSettings: settings });
+                    // Try to apply settings immediately to the tab that requested the change
+                    if (tabId) {
+                        try {
+                            browserApi.tabs.sendMessage(tabId, { command: "setVolume", dB: settings[domain].volume }, () => {});
+                            browserApi.tabs.sendMessage(tabId, { command: "setMono", mono: Boolean(settings[domain].mono) }, () => {});
+                        } catch (e) { /* ignore */ }
+                    }
+                }
             }
-            await storageSet({ whitelist: newData.whitelist });
         } else {
             newData.fqdns = data.fqdns || [];
             if (shouldExclude) {
@@ -207,6 +242,22 @@ async function saveSiteSettings(tab) {
             mono: Boolean(monoCheckbox?.checked)
         };
         await storageSet({ siteSettings: data.siteSettings });
+
+        // Notify the content script in this tab immediately so volume/mono are applied without waiting
+        if (tab && tab.id) {
+            try {
+                browserApi.tabs.sendMessage(tab.id, { command: "setVolume", dB: data.siteSettings[domain].volume }, () => {
+                    if (browserApi.runtime && browserApi.runtime.lastError) {
+                        // It's possible the content script hasn't injected into the page yet; ignore harmless errors.
+                    }
+                });
+                browserApi.tabs.sendMessage(tab.id, { command: "setMono", mono: Boolean(data.siteSettings[domain].mono) }, () => {
+                    if (browserApi.runtime && browserApi.runtime.lastError) {}
+                });
+            } catch (e) {
+                // ignore messaging errors
+            }
+        }
     } catch (e) {
         handleError(e);
     }

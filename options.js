@@ -8,6 +8,8 @@ function formatDb(v) {
 
 // debounce timer for memory list rendering to avoid double-renders when storage changes
 let memoryListRenderTimeout = null;
+// debounce for fqdn list updates
+let fqdnListRenderTimeout = null;
 
 function storageGet(keys) {
     return new Promise((resolve, reject) => {
@@ -147,6 +149,7 @@ function createMemoryEntry(domain, settings, onRemove, onUpdate, onRename) {
 }
 
 let memoryListRendering = false;
+let fqdnListRendering = false;
 
 async function renderMemoryList() {
     if (memoryListRendering) return; // avoid concurrent renders
@@ -204,15 +207,30 @@ async function renderMemoryList() {
 }
 
 async function renderFqdnList() {
+    if (fqdnListRendering) return; // avoid concurrent renders
+    fqdnListRendering = true;
     try {
         const container = document.getElementById('fqdnList');
-        if (!container) return;
+        if (!container) {
+            fqdnListRendering = false;
+            return;
+        }
         container.innerHTML = '';
 
-        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
+        const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false, siteSettings: {}, archivedFqdns: [] });
         const fqdns = data.fqdns || [];
-        const whitelist = data.whitelist || [];
-        const list = data.whitelistMode ? whitelist : fqdns;
+        let list;
+        if (data.whitelistMode) {
+            // When whitelist mode is active we hide the blocklist; show an informational message about archived sites
+            const archivedCount = (data.archivedFqdns || []).length;
+            const empty = document.createElement('div');
+            empty.className = 'empty-msg';
+            empty.textContent = `Blocklist is hidden while whitelist mode is active. Archived ${archivedCount} site${archivedCount === 1 ? '' : 's'}. Manage allowed sites in Remembered Settings.`;
+            container.appendChild(empty);
+            return;
+        } else {
+            list = fqdns;
+        }
 
         if (!list.length) {
             const empty = document.createElement('div');
@@ -238,9 +256,13 @@ async function renderFqdnList() {
             removeBtn.textContent = '×';
             removeBtn.addEventListener('click', async () => {
                 if (data.whitelistMode) {
-                    const idx = whitelist.indexOf(d);
-                    if (idx > -1) whitelist.splice(idx, 1);
-                    await storageSet({ whitelist });
+                    // remove from remembered siteSettings
+                    const sd = await storageGet({ siteSettings: {} });
+                    const settings = sd.siteSettings || {};
+                    if (settings[d]) {
+                        delete settings[d];
+                        await storageSet({ siteSettings: settings });
+                    }
                 } else {
                     const idx = fqdns.indexOf(d);
                     if (idx > -1) fqdns.splice(idx, 1);
@@ -255,6 +277,8 @@ async function renderFqdnList() {
         }
     } catch (e) {
         console.error('Options: renderFqdnList error', e);
+    } finally {
+        fqdnListRendering = false;
     }
 }
 
@@ -266,10 +290,47 @@ async function initOptions() {
     const newFqdnInput = document.getElementById('newFqdn');
 
     if (whitelistModeCheckbox) {
-        const data = await storageGet({ whitelistMode: false });
+        const data = await storageGet({ whitelistMode: false, archivedFqdns: [] });
         whitelistModeCheckbox.checked = !!data.whitelistMode;
+        const listTitle = document.getElementById('listTitle');
+        const fqdnAddGroup = newFqdnInput ? newFqdnInput.parentElement : null;
+        const fqdnListContainer = document.getElementById('fqdnList');
+
+        // Helper to show/hide the blocklist UI
+        function setBlocklistVisible(show) {
+            if (listTitle) listTitle.style.display = show ? 'block' : 'none';
+            if (fqdnAddGroup) fqdnAddGroup.style.display = show ? 'flex' : 'none';
+            if (fqdnListContainer) fqdnListContainer.style.display = show ? 'block' : 'none';
+        }
+
+        // Initialize visibility
+        setBlocklistVisible(!data.whitelistMode);
+
         whitelistModeCheckbox.addEventListener('change', async (e) => {
-            await storageSet({ whitelistMode: e.target.checked });
+            const enabled = e.target.checked;
+            if (enabled) {
+                // Archive current blacklist instead of deleting it
+                const d = await storageGet({ fqdns: [], archivedFqdns: [] });
+                if (d.fqdns && d.fqdns.length) {
+                    await storageSet({ archivedFqdns: d.fqdns, fqdns: [] });
+                } else {
+                    // ensure archivedFqdns exists
+                    await storageSet({ archivedFqdns: d.archivedFqdns || [] });
+                }
+                await storageSet({ whitelistMode: true });
+                setBlocklistVisible(false);
+            } else {
+                // Restore archived blacklist if current list is empty
+                const d = await storageGet({ fqdns: [], archivedFqdns: [] });
+                if ((!d.fqdns || d.fqdns.length === 0) && d.archivedFqdns && d.archivedFqdns.length) {
+                    await storageSet({ fqdns: d.archivedFqdns, archivedFqdns: [], whitelistMode: false });
+                } else {
+                    await storageSet({ whitelistMode: false });
+                }
+                setBlocklistVisible(true);
+            }
+            // Immediately update displayed list so UI reflects mode change without waiting for storage.onChanged
+            await renderFqdnList();
         });
     }
 
@@ -287,14 +348,20 @@ async function initOptions() {
             if (!v) return;
             const data = await storageGet({ fqdns: [], whitelist: [], whitelistMode: false });
             if (data.whitelistMode) {
-                data.whitelist = data.whitelist || [];
-                if (!data.whitelist.includes(v)) data.whitelist.push(v);
-                await storageSet({ whitelist: data.whitelist });
+                // Add as a remembered site so whitelist contains only remembered sites
+                const sd = await storageGet({ siteSettings: {} });
+                const settings = sd.siteSettings || {};
+                if (!settings[v]) {
+                    settings[v] = { volume: 0, mono: false };
+                    await storageSet({ siteSettings: settings });
+                }
             } else {
                 data.fqdns = data.fqdns || [];
                 if (!data.fqdns.includes(v)) data.fqdns.push(v);
                 await storageSet({ fqdns: data.fqdns });
             }
+            // Refresh list immediately so the UI reflects the addition without waiting for storage.onChanged
+            await renderFqdnList();
             newFqdnInput.value = '';
         });
     }
@@ -333,8 +400,20 @@ async function initOptions() {
                 renderMemoryList();
                 memoryListRenderTimeout = null;
             }, 50);
+            // Also refresh fqdn list because whitelist mode displays remembered sites
+            if (fqdnListRenderTimeout) clearTimeout(fqdnListRenderTimeout);
+            fqdnListRenderTimeout = setTimeout(() => {
+                renderFqdnList();
+                fqdnListRenderTimeout = null;
+            }, 50);
         }
-        if (changes.fqdns || changes.whitelist || changes.whitelistMode) renderFqdnList();
+        if (changes.fqdns || changes.whitelist || changes.whitelistMode) {
+            if (fqdnListRenderTimeout) clearTimeout(fqdnListRenderTimeout);
+            fqdnListRenderTimeout = setTimeout(() => {
+                renderFqdnList();
+                fqdnListRenderTimeout = null;
+            }, 50);
+        }
     });
 }
 
